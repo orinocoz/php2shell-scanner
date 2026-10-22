@@ -20,13 +20,17 @@ Each tested path may receive a 42-byte control request and three probes totallin
 
 ## Wildcard Subdomain Scanning
 
-Targets written in `*.domain.com` style are expanded into the apex domain plus every subdomain DNSDumpster knows for that domain, and each resulting host is scanned:
+Targets written in `*.domain.com` style are expanded into the apex domain plus every known subdomain, and each resulting host is scanned:
 
 ```
-python3 scanner.py -u "*.example.com" --dnsdumpster-key YOUR_KEY
+python3 scanner.py -u "*.example.com"
 ```
 
-Expansion uses the official DNSDumpster API (`https://api.dnsdumpster.com/domain/<domain>`), which requires an API key. Free keys are available at [dnsdumpster.com](https://dnsdumpster.com/membership/). The key can be supplied with `--dnsdumpster-key` or the `DNSDUMPSTER_API_KEY` environment variable.
+Two discovery sources are available, controlled with `--subdomain-source`:
+
+- `dnsdumpster` — the official DNSDumpster API (`https://api.dnsdumpster.com/domain/<domain>`). Needs an API key, which is free at [dnsdumpster.com](https://dnsdumpster.com/membership/); supply it with `--dnsdumpster-key` or the `DNSDUMPSTER_API_KEY` environment variable. Free keys return up to 50 records per domain; Plus keys return up to 200 per page and pagination is followed automatically. The API is rate limited to one request every 2 seconds, which the scanner observes.
+- `crtsh` — certificate transparency logs via [crt.sh](https://crt.sh/). Needs no API key and no signup, but only finds subdomains that have appeared on TLS certificates.
+- `auto` (default) — uses DNSDumpster when an API key is available, otherwise falls back to crt.sh.
 
 Details:
 
@@ -34,10 +38,8 @@ Details:
 - Wildcards work in `-l` list files too, mixed freely with regular hosts.
 - `http://*.example.com` or `*.example.com:8080` apply that scheme or port to every discovered host; the default is `https` on the standard port.
 - Only real web subdomains are kept: wildcard entries and underscore records such as `_dmarc` or `_sip._tcp` are skipped, as are hosts outside the requested domain.
-- Free keys return up to 50 records per domain; Plus keys return up to 200 per page and the scanner follows pagination automatically.
-- The API is rate limited to one request every 2 seconds, which the scanner observes between requests.
 - Discovered host lists are recorded in the JSON output under `wildcard_expansions` when `-o` is used.
-- Without a key the scanner refuses to expand wildcards and explains how to obtain one.
+- When discovery fails for a pattern (for example a rate limit), the scanner reports it and continues with the remaining targets.
 
 ## Requirements
 
@@ -65,12 +67,18 @@ Scan a list of hosts:
 python3 scanner.py -l hosts.txt
 ```
 
-Scan every subdomain DNSDumpster knows for a domain (plus the apex domain):
+Scan every known subdomain for a domain (plus the apex domain), no API key needed:
 
 ```
-export DNSDUMPSTER_API_KEY=your_key_here
 python3 scanner.py -u "*.example.com"
 python3 scanner.py -l hosts.txt   # hosts.txt may contain *.domain.com lines
+```
+
+Prefer DNSDumpster results by providing an API key:
+
+```
+export DNSDUMPSTER_API_KEY=your_free_key
+python3 scanner.py -u "*.example.com" --subdomain-source dnsdumpster
 ```
 
 Scan with multiple threads and save results:
@@ -116,8 +124,10 @@ python3 scanner.py -u https://example.com --sapi fpm
 --sapi            Verdict rules: auto, mod_php, or fpm (default: auto)
 --path            Custom path to test (can be used multiple times)
 --path-file       File containing paths to test (one per line)
---dnsdumpster-key API key for expanding '*.domain.com' targets
+--dnsdumpster-key API key for the DNSDumpster subdomain source
                   (default: $DNSDUMPSTER_API_KEY)
+--subdomain-source Where '*.domain.com' subdomains come from:
+                  auto, dnsdumpster, or crtsh (default: auto)
 ```
 
 ## Credits

@@ -66,6 +66,10 @@ DNSDUMPSTER_API_KEY_ENV = "DNSDUMPSTER_API_KEY"
 DNSDUMPSTER_RATE_LIMIT_SECONDS = 2.0
 DNSDUMPSTER_MAX_PAGES = 10
 DNSDUMPSTER_RESPONSE_LIMIT = 8 << 20
+CRTSH_URL = "https://crt.sh/?q=%.{domain}&output=json"
+CRTSH_MIN_INTERVAL_SECONDS = 1.0
+CRTSH_RESPONSE_LIMIT = 32 << 20
+SUBDOMAIN_SOURCES = ("auto", "dnsdumpster", "crtsh")
 
 PROBES = ((1, 4000), (8, 1020), (20, 1020))
 REJECTED_STATUSES = {400, 403, 411, 413, 414, 417, 422, 429, 431}
@@ -1051,7 +1055,7 @@ def parse_wildcard_pattern(raw: str) -> Tuple[str, str, Optional[int]]:
     return scheme, hostname, port
 
 
-class DNSDumpsterError(Exception):
+class SubdomainSourceError(Exception):
     """Raised when the DNSDumpster API cannot return results."""
 
 
@@ -1104,29 +1108,29 @@ def dnsdumpster_get(
     except urllib.error.HTTPError as exc:
         detail = dnsdumpster_error_detail(exc)
         if exc.code == 429:
-            raise DNSDumpsterError(
+            raise SubdomainSourceError(
                 "DNSDumpster API rate limit exceeded; retry in a few seconds"
             ) from exc
         if tolerate_http_error:
             return None
         suffix = f": {detail}" if detail else ""
-        raise DNSDumpsterError(
+        raise SubdomainSourceError(
             f"DNSDumpster API request failed (HTTP {exc.code}){suffix}"
         ) from exc
     except urllib.error.URLError as exc:
-        raise DNSDumpsterError(f"DNSDumpster API request failed: {exc.reason}") from exc
+        raise SubdomainSourceError(f"DNSDumpster API request failed: {exc.reason}") from exc
     except OSError as exc:
-        raise DNSDumpsterError(f"DNSDumpster API request failed: {exc}") from exc
+        raise SubdomainSourceError(f"DNSDumpster API request failed: {exc}") from exc
 
     try:
         payload = json.loads(raw)
     except ValueError as exc:
-        raise DNSDumpsterError("DNSDumpster API returned invalid JSON") from exc
+        raise SubdomainSourceError("DNSDumpster API returned invalid JSON") from exc
     if not isinstance(payload, dict):
-        raise DNSDumpsterError("DNSDumpster API returned an unexpected response")
+        raise SubdomainSourceError("DNSDumpster API returned an unexpected response")
     api_error = payload.get("error")
     if isinstance(api_error, str):
-        raise DNSDumpsterError(f"DNSDumpster API error: {api_error}")
+        raise SubdomainSourceError(f"DNSDumpster API error: {api_error}")
     return payload
 
 
@@ -1192,8 +1196,78 @@ def fetch_dnsdumpster_hosts(domain: str, api_key: str, timeout: int) -> List[str
     return qualify_subdomains(domain, names)
 
 
+_crtsh_last_request = 0.0
+
+
+def crtsh_wait_slot() -> None:
+    """Be polite to crt.sh by spacing out requests."""
+    global _crtsh_last_request
+    elapsed = time.monotonic() - _crtsh_last_request
+    if elapsed < CRTSH_MIN_INTERVAL_SECONDS:
+        time.sleep(CRTSH_MIN_INTERVAL_SECONDS - elapsed)
+    _crtsh_last_request = time.monotonic()
+
+
+def fetch_crtsh_hosts(domain: str, timeout: int) -> List[str]:
+    """Return every subdomain crt.sh knows for domain.
+
+    crt.sh indexes certificate transparency logs, so this needs no API key.
+    """
+    url = CRTSH_URL.format(domain=quote(domain, safe=""))
+    request = urllib.request.Request(
+        url, headers={"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"}
+    )
+    crtsh_wait_slot()
+    try:
+        with urllib.request.urlopen(request, timeout=max(timeout, 60)) as response:
+            raw = response.read(CRTSH_RESPONSE_LIMIT)
+    except urllib.error.HTTPError as exc:
+        raise SubdomainSourceError(
+            f"crt.sh request failed (HTTP {exc.code})"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise SubdomainSourceError(f"crt.sh request failed: {exc.reason}") from exc
+    except OSError as exc:
+        raise SubdomainSourceError(f"crt.sh request failed: {exc}") from exc
+
+    try:
+        records = json.loads(raw)
+    except ValueError as exc:
+        raise SubdomainSourceError(
+            "crt.sh returned invalid JSON; the service may be overloaded"
+        ) from exc
+    if not isinstance(records, list):
+        raise SubdomainSourceError("crt.sh returned an unexpected response")
+
+    names: List[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        # name_value holds every SAN of the certificate, one per line.
+        name_value = record.get("name_value")
+        if isinstance(name_value, str):
+            names.extend(name_value.splitlines())
+        common_name = record.get("common_name")
+        if isinstance(common_name, str):
+            names.append(common_name)
+    return qualify_subdomains(domain, names)
+
+
+def discover_subdomains(
+    domain: str, source: str, api_key: Optional[str], timeout: int
+) -> List[str]:
+    """Look up the subdomains of domain with the chosen source."""
+    if source == "dnsdumpster":
+        return fetch_dnsdumpster_hosts(domain, api_key or "", timeout)
+    return fetch_crtsh_hosts(domain, timeout)
+
+
 def expand_wildcard_targets(
-    patterns: List[str], api_key: str, timeout: int, announce: bool = True
+    patterns: List[str],
+    source: str,
+    api_key: Optional[str],
+    timeout: int,
+    announce: bool = True,
 ) -> Tuple[List[str], Dict[str, List[str]], List[str]]:
     """Expand '*.domain' patterns into concrete scan targets.
 
@@ -1203,6 +1277,7 @@ def expand_wildcard_targets(
     targets: List[str] = []
     expansions: Dict[str, List[str]] = {}
     errors: List[str] = []
+    source_label = "DNSDumpster" if source == "dnsdumpster" else "crt.sh"
 
     unique: List[str] = []
     seen_patterns = set()
@@ -1226,10 +1301,12 @@ def expand_wildcard_targets(
         apex = f"{prefix}{domain}{suffix}"
 
         if announce:
-            print(colorize(f"[*] Querying DNSDumpster for {domain} ...", Colors.CYAN))
+            print(
+                colorize(f"[*] Querying {source_label} for {domain} ...", Colors.CYAN)
+            )
         try:
-            discovered = fetch_dnsdumpster_hosts(domain, api_key, timeout)
-        except DNSDumpsterError as exc:
+            discovered = discover_subdomains(domain, source, api_key, timeout)
+        except SubdomainSourceError as exc:
             errors.append(f"{pattern}: {exc}")
             if announce:
                 print(colorize(f"[!] {pattern}: {exc}", Colors.YELLOW))
@@ -1242,7 +1319,7 @@ def expand_wildcard_targets(
             print(
                 colorize(
                     f"[+] {pattern}: {len(discovered)} subdomain(s) found "
-                    f"plus the apex domain {domain}",
+                    f"via {source_label} plus the apex domain {domain}",
                     Colors.GREEN,
                 )
             )
@@ -1399,6 +1476,17 @@ Examples:
             "https://dnsdumpster.com/membership/)"
         ),
     )
+    parser.add_argument(
+        "--subdomain-source",
+        choices=SUBDOMAIN_SOURCES,
+        default="auto",
+        help=(
+            "Where to discover subdomains for '*.domain.com' targets: "
+            "dnsdumpster (needs an API key), crtsh (certificate "
+            "transparency, no key needed), or auto (default: DNSDumpster "
+            "when a key is available, otherwise crt.sh)"
+        ),
+    )
     return parser
 
 
@@ -1423,19 +1511,38 @@ def main() -> None:
     hosts_input = [value for value in loaded_hosts if not is_wildcard_pattern(value)]
 
     expansions: Dict[str, List[str]] = {}
+    source_label = ""
     if patterns:
         api_key = (
             args.dnsdumpster_key or os.environ.get(DNSDUMPSTER_API_KEY_ENV) or ""
         ).strip()
-        if not api_key:
+        source = args.subdomain_source
+        if source == "auto":
+            source = "dnsdumpster" if api_key else "crtsh"
+        if source == "dnsdumpster" and not api_key:
             raise SystemExit(
-                "Wildcard targets (*.domain.com) require a DNSDumpster API key.\n"
+                "The DNSDumpster subdomain source requires an API key.\n"
                 "Pass --dnsdumpster-key KEY or set the "
-                f"{DNSDUMPSTER_API_KEY_ENV} environment variable.\n"
-                "Free keys: https://dnsdumpster.com/membership/"
+                f"{DNSDUMPSTER_API_KEY_ENV} environment variable "
+                "(free keys: https://dnsdumpster.com/membership/),\n"
+                "or use --subdomain-source crtsh to discover subdomains "
+                "without a key."
             )
+        if source == "crtsh":
+            api_key = None
+            source_label = "crt.sh"
+            if args.subdomain_source == "auto" and not args.quiet:
+                print(
+                    colorize(
+                        "[*] No DNSDumpster API key found; discovering "
+                        "subdomains via crt.sh (certificate transparency)",
+                        Colors.CYAN,
+                    )
+                )
+        else:
+            source_label = "DNSDumpster"
         expanded, expansions, expand_errors = expand_wildcard_targets(
-            patterns, api_key, args.timeout, announce=not args.quiet
+            patterns, source, api_key, args.timeout, announce=not args.quiet
         )
         hosts_input.extend(expanded)
         if not expanded and expand_errors:
@@ -1461,7 +1568,7 @@ def main() -> None:
             print(
                 colorize(
                     f"[*] Expanded {len(expansions)} wildcard pattern(s) into "
-                    f"{expanded_count} host(s) via DNSDumpster",
+                    f"{expanded_count} host(s) via {source_label}",
                     Colors.CYAN,
                 )
             )
