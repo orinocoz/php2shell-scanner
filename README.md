@@ -140,7 +140,51 @@ The scanner was built by the Assetnote Security Research Team using logic built 
 
 ## Output
 
-Results are printed to the terminal. When using `-o`, vulnerable hosts are saved to a JSON file with the verdict reason and redacted HTTP request/response evidence.
+Results are printed to the terminal. When using `-o`, vulnerable hosts are saved to a JSON file with the verdict reason and redacted HTTP request/response evidence; add `--all-results` to keep every verdict.
+
+### Verdicts
+
+| Verdict | Meaning | Trust it? |
+| --- | --- | --- |
+| `VULNERABLE` | A crash signal matched, or `X-Powered-By` advertises an unpatched PHP release | Yes |
+| `FIXED` | No crash and `X-Powered-By` advertises a patched release | Yes |
+| `NO SIGNAL` | No crash, but the server does not advertise its PHP version | **Not proof of safety** — the probes ran clean, but without a version header the scanner cannot confirm the running PHP is patched; verify the version manually or expose `X-Powered-By` |
+| `INCONCLUSIVE` | The target responded, but the verdict could not be established (probes rejected by a proxy/WAF, the endpoint already returned 5xx, the connection dropped mid-upload) | No — the probes never reached PHP or the result is ambiguous |
+| `ERROR` | The target was never tested (DNS, TLS, timeout, connection failure) | No — nothing was tested |
+
+`-v` prints the reason for every verdict, and INCONCLUSIVE/ERROR reasons are shown even without it.
+
+### Error categories
+
+Transport failures carry an `error_category` in the JSON (`result.error_category`, and per-request in the `control` and `probes` objects), together with a plain-language explanation of what happened and what to do next:
+
+| Category | Meaning |
+| --- | --- |
+| `dns` | The hostname does not resolve; the target was never contacted |
+| `tls` | TLS handshake or certificate verification failed (try `-k` for self-signed certificates) |
+| `timeout` | No response within `--timeout` seconds |
+| `connection` | Connection refused or a network error while connecting |
+| `protocol` | The peer sent malformed or incomplete HTTP (a proxy or portal may be intercepting) |
+| `transport` | The HTTP exchange was interrupted mid-response |
+| `request` | The request could not be encoded for this target |
+| `unknown` | Unexpected failure; please report it |
+
+Rejections before PHP parsed the probes use `request_rejected`, and an already-failing endpoint uses `server_error`.
+
+### Triage with jq
+
+```bash
+python3 scanner.py -l hosts.txt -o results.json --all-results
+
+# Summary by verdict
+jq -r '.results | group_by(.verdict)[] | "\(.[0].verdict): \(length)"' results.json
+
+# Host + verdict + reason for everything that is not a confirmed clean result
+jq -r '.results[] | select(.verdict != "FIXED") | "\(.verdict)\t\(.host)\t\(.reason // .error)"' results.json
+
+# Group the untestable hosts by failure cause
+jq -r '.results[] | select(.error_category != null) | .error_category' results.json | sort | uniq -c
+```
 
 ## Limitations
 

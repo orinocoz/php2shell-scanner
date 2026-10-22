@@ -188,7 +188,15 @@ mapping each pattern to the exact hosts it produced:
 ```
 
 By default only vulnerable hosts appear in `results`; add `--all-results` to
-keep every verdict (FIXED, NO SIGNAL, INCONCLUSIVE, ERROR).
+keep every verdict (FIXED, NO SIGNAL, INCONCLUSIVE, ERROR). Verdict meanings
+and the `error_category` field for untestable hosts are documented in the
+[README's Output section](../README.md#output):
+
+```bash
+# Which discovered hosts could not be tested, and why?
+jq -r '.results[] | select(.error_category != null)
+       | "\(.host)\t\(.error_category)\t\(.error)"' results.json
+```
 
 ## How discovery works
 
