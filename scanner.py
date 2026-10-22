@@ -10,6 +10,7 @@
 
 import argparse
 import asyncio
+import html
 import json
 import os
 import re
@@ -25,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, quote, urljoin, urlsplit, urlunsplit
 
 try:
     import h11
@@ -74,6 +75,16 @@ SUBDOMAIN_SOURCES = ("auto", "dnsdumpster", "crtsh")
 
 PROBES = ((1, 4000), (8, 1020), (20, 1020))
 REJECTED_STATUSES = {400, 403, 411, 413, 414, 417, 422, 429, 431}
+# Apache/nginx answer POST to a static directory with 405/501; a GET then
+# returns the listing, so those statuses trigger one extra listing fetch.
+LISTING_METHOD_STATUSES = {405, 501}
+DIRECTORY_INDEX_PATTERN = re.compile(
+    rb"<(?:title|h1)[^>]*>\s*Index of\b", re.IGNORECASE
+)
+PHP_HREF_PATTERN = re.compile(r"""href\s*=\s*["']([^"'<>]+)["']""", re.IGNORECASE)
+MAX_LISTING_PATHS = 10
+MAX_LISTING_DEPTH = 1
+VERDICT_PRIORITY = {"NO SIGNAL": 0, "FIXED": 1, "INCONCLUSIVE": 2, "ERROR": 2}
 REJECTION_HINTS = {
     400: "the server rejected the multipart body before PHP parsed it",
     403: "a WAF or an access-control rule blocked the probe before PHP parsed it",
@@ -824,6 +835,7 @@ def base_result(host: str) -> dict:
         "tested_url": None,
         "control": None,
         "probes": [],
+        "discovered_paths": [],
         "timestamp": utc_now(),
     }
 
@@ -844,6 +856,64 @@ def response_metadata(response: HTTPResult) -> dict:
     }
 
 
+def is_directory_listing(body: bytes) -> bool:
+    """True when the response body is an Apache/nginx autoindex page."""
+    return bool(DIRECTORY_INDEX_PATTERN.search(body))
+
+
+def extract_php_links(listing_url: str, body: bytes) -> List[str]:
+    """Return absolute .php URLs linked from a directory listing body."""
+    listing = urlsplit(listing_url)
+    base_path = listing.path
+    if not base_path.endswith("/"):
+        base_path = base_path.rsplit("/", 1)[0] + "/"
+    base = urlunsplit((listing.scheme, listing.netloc, base_path, "", ""))
+    found: List[str] = []
+    seen = set()
+    text = body.decode("utf-8", errors="replace")
+    for raw in PHP_HREF_PATTERN.findall(text):
+        href = html.unescape(raw).strip()
+        if not href or href.startswith(("#", "?")):
+            continue
+        absolute = urljoin(base, href)
+        parsed = urlsplit(absolute)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if parsed.netloc.lower() != listing.netloc.lower():
+            continue
+        if not parsed.path.lower().endswith(".php"):
+            continue
+        clean = urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, parsed.query, "")
+        )
+        if clean not in seen:
+            seen.add(clean)
+            found.append(clean)
+    return found
+
+
+def fetch_listing(url: str, timeout: int, verify_ssl: bool) -> Optional[bytes]:
+    """GET url and return the body when the server answers with a listing.
+
+    Some servers reject POST to a static directory with 405/501; the same
+    path fetched with GET then returns the autoindex page.
+    """
+    context = ssl.create_default_context()
+    if not verify_ssl:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    request = urllib.request.Request(
+        url, headers={"User-Agent": DEFAULT_USER_AGENT, "Accept": "text/html"}
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=timeout, context=context
+        ) as response:
+            return response.read(BODY_READ_LIMIT)
+    except (urllib.error.URLError, OSError):
+        return None
+
+
 def check_url(
     host: str,
     target_url: str,
@@ -851,6 +921,7 @@ def check_url(
     verify_ssl: bool,
     custom_headers: Dict[str, str],
     sapi: str,
+    listing_depth: int = 0,
 ) -> dict:
     result = base_result(host)
     result["tested_url"] = target_url
@@ -932,6 +1003,55 @@ def check_url(
             )
             result["reason"] = result["error"]
             return result
+
+    # A static directory listing is not a PHP endpoint: probe the .php files
+    # it links to instead of burning probes on the listing itself.
+    if control.status_code in LISTING_METHOD_STATUSES:
+        fetched = fetch_listing(target_url, timeout, verify_ssl)
+        if fetched is not None and is_directory_listing(fetched):
+            control = HTTPResult(
+                status_code=200,
+                headers={"Content-Type": "text/html"},
+                body=fetched,
+            )
+            apply_response(result, control)
+    if listing_depth < MAX_LISTING_DEPTH and is_directory_listing(control.body):
+        php_links = extract_php_links(target_url, control.body)[:MAX_LISTING_PATHS]
+        result["discovered_paths"] = php_links
+        if not php_links:
+            result["vulnerable"] = False
+            result["verdict"] = "NO SIGNAL"
+            result["reason"] = (
+                "the target is a directory listing and links no .php files, "
+                "so there is nothing PHP to probe"
+            )
+            return result
+        best: Optional[dict] = None
+        for php_url in php_links:
+            sub = check_url(
+                host,
+                php_url,
+                timeout,
+                verify_ssl,
+                custom_headers,
+                sapi,
+                listing_depth=listing_depth + 1,
+            )
+            if sub["vulnerable"] is True:
+                sub["discovered_paths"] = php_links
+                sub["reason"] = f"found via directory listing at {target_url}: {sub['reason']}"
+                return sub
+            if best is None or VERDICT_PRIORITY.get(
+                sub["verdict"], 0
+            ) > VERDICT_PRIORITY.get(best["verdict"], 0):
+                best = sub
+        if best is not None:
+            best["discovered_paths"] = php_links
+            best["reason"] = (
+                f"found via directory listing at {target_url} "
+                f"({len(php_links)} .php file(s) tested): {best['reason']}"
+            )
+            return best
 
     powered_by = control.powered_by
     rejected = False

@@ -10,13 +10,19 @@ A target is reported vulnerable when the probe produces a PHP memory-exhaustion 
 
 The scanner tests `/index.php` by default. A path supplied in the URL is preserved, and `--path` or `--path-file` can test custom paths. phpMyAdmin targets are automatically retested at `/show_config_errors.php`. Redirects are not followed.
 
+### Directory Listing Discovery
+
+When the tested path answers with a directory listing (Apache/nginx autoindex, detected by an `Index of` title or heading), the scanner does not probe the listing itself. Instead it extracts every `.php` link (up to 10, relative and absolute, same host only) and runs the control request plus probes against each file, reporting the best verdict found. A listing that links no `.php` files is reported as `NO SIGNAL` with an explicit reason instead of burning probes.
+
+Servers that reject `POST` to a static directory with `405`/`501` are handled: the scanner re-fetches the path with `GET` and uses that listing. Discovered paths are recorded in the JSON output under `discovered_paths`, and verdict reasons note that the endpoint was `found via directory listing at <url>`.
+
 ### SAPI Modes
 
 The default `--sapi auto` mode applies both mod_php and PHP-FPM verdict rules, matching the combined behavior of Assetnote's postmodules. Use `--sapi mod_php` or `--sapi fpm` to restrict detection to a known SAPI.
 
 ### Network Impact
 
-Each tested path may receive a 42-byte control request and three probes totalling about 29 MiB. Probing stops as soon as the verdict is settled, and duplicate input URLs are scanned once.
+Each tested path may receive a 42-byte control request and three probes totalling about 29 MiB. A directory listing instead costs one control request (or one `GET` when `POST` is refused) plus up to ten discovered `.php` files tested as normal paths. Probing stops as soon as the verdict is settled, and duplicate input URLs are scanned once.
 
 ## Wildcard Subdomain Scanning
 
