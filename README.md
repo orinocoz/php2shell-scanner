@@ -61,12 +61,64 @@ Details:
 pip install -r requirements.txt
 ```
 
+## Docker
+
+Build the image from the project directory:
+
+```sh
+docker build -t php2shell-scanner .
+```
+
+Scan a host and test a custom path:
+
+```sh
+docker run --rm php2shell-scanner -u https://example.com --path /admin.php
+```
+
+Test multiple paths by repeating `--path`:
+
+```sh
+docker run --rm php2shell-scanner -u https://example.com \
+  --path /index.php --path /admin.php
+```
+
+To use local input and output files, mount the current directory at `/work`:
+
+```sh
+docker run --rm -v "$PWD:/work" -w /work php2shell-scanner \
+  -l hosts.txt -t 20 -o results.json --path /index.php --path /admin.php
+```
+
+For `--path-file`, put the file in the mounted directory and refer to it by its
+container path:
+
+```sh
+docker run --rm -v "$PWD:/work" -w /work php2shell-scanner \
+  -u https://example.com --path-file /work/paths.txt
+```
+
+For wildcard scans using DNSDumpster, pass the API key through an environment
+variable:
+
+```sh
+docker run --rm -e DNSDUMPSTER_API_KEY \
+  php2shell-scanner -u '*.example.com' --subdomain-source dnsdumpster
+```
+
 ## Usage
 
 Scan a single host:
 
 ```
 python3 scanner.py -u https://example.com
+```
+
+The URL may include a path, with or without a trailing slash. That exact path
+is scanned (instead of the default `/index.php`):
+
+```
+python3 scanner.py -u https://example.com/path
+python3 scanner.py -u https://example.com/path/
 ```
 
 Scan a list of hosts:
@@ -108,6 +160,10 @@ python3 scanner.py -u https://example.com --path /phpinfo.php
 python3 scanner.py -u https://example.com --path /index.php --path /admin.php
 python3 scanner.py -u https://example.com --path-file paths.txt
 ```
+
+Use a URL path such as `https://example.com/path/` to scan that path directly.
+The `--path` option overrides the URL path and can be repeated to test several
+paths.
 
 Use only PHP-FPM verdict rules:
 
