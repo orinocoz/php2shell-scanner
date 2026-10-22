@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import time
@@ -73,6 +74,18 @@ SUBDOMAIN_SOURCES = ("auto", "dnsdumpster", "crtsh")
 
 PROBES = ((1, 4000), (8, 1020), (20, 1020))
 REJECTED_STATUSES = {400, 403, 411, 413, 414, 417, 422, 429, 431}
+REJECTION_HINTS = {
+    400: "the server rejected the multipart body before PHP parsed it",
+    403: "a WAF or an access-control rule blocked the probe before PHP parsed it",
+    411: "the server demanded a Content-Length header the scanner always sends",
+    413: "the probe exceeds the maximum request body accepted by a proxy or "
+    "web server in front of PHP",
+    414: "the request target was rejected as too long",
+    417: "the server rejected the request expectations",
+    422: "the server refused to process the multipart body",
+    429: "the target is rate limiting the scan; retry later with fewer threads",
+    431: "the request headers were rejected as too large",
+}
 FIXED_VERSIONS = {(8, 2): 35, (8, 3): 36, (8, 4): 27, (8, 5): 12}
 VERSION_PATTERN = re.compile(r"PHP/(\d+)\.(\d+)\.(\d+)")
 HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -103,6 +116,7 @@ class HTTPResult:
     body: bytes = b""
     bytes_sent: int = 0
     error: Optional[str] = None
+    error_category: Optional[str] = None
 
     @property
     def powered_by(self) -> str:
@@ -584,6 +598,64 @@ async def timed_exchange_post(
     )
 
 
+def classify_send_failure(exc: BaseException, timeout: int) -> Tuple[str, str]:
+    """Explain a failed exchange as a (category, detail) pair.
+
+    The detail spells out what happened and what it means, so an
+    INCONCLUSIVE or ERROR result can be triaged from the report alone.
+    """
+    if isinstance(exc, socket.gaierror):
+        return (
+            "dns",
+            f"{exc} — the hostname does not resolve, so the target was never "
+            "contacted; check the URL spelling or DNS availability",
+        )
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return (
+            "tls",
+            f"{exc} — the TLS certificate could not be verified; pass "
+            "-k/--insecure if a self-signed or mismatched certificate is expected",
+        )
+    if isinstance(exc, ssl.SSLError):
+        return (
+            "tls",
+            f"{exc} — the TLS handshake failed before any HTTP data was exchanged",
+        )
+    if isinstance(exc, ConnectionRefusedError):
+        return (
+            "connection",
+            f"{exc} — nothing accepted the connection on this host and port; "
+            "the service may be down or firewalled",
+        )
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return (
+            "timeout",
+            f"no response within {timeout}s — the host may be unreachable, "
+            "overloaded, or rate limiting; raise --timeout to retry slower targets",
+        )
+    if isinstance(exc, h11.RemoteProtocolError):
+        return (
+            "protocol",
+            f"{exc} — the peer sent a malformed or incomplete HTTP response; "
+            "a proxy or captive portal may be intercepting the connection",
+        )
+    if isinstance(exc, HTTPTransportError):
+        return (
+            "transport",
+            f"{exc} — the HTTP exchange was interrupted; re-run to rule out "
+            "a transient network failure",
+        )
+    if isinstance(exc, (h11.LocalProtocolError, ValueError, UnicodeError)):
+        return "request", f"{exc} — the request could not be encoded for this target"
+    if isinstance(exc, OSError):
+        return (
+            "connection",
+            f"{exc.strerror or exc} — network error while connecting or "
+            "transferring data",
+        )
+    return "unknown", f"{exc!r} — unexpected failure"
+
+
 def send_post(
     target_url: str,
     body: bytes,
@@ -602,18 +674,18 @@ def send_post(
         result.reason = response.reason
         result.headers = response.headers
         result.body = response.body
-    except ssl.SSLError as exc:
-        result.error = f"SSL error: {exc}"
-    except asyncio.TimeoutError:
-        result.error = "request timed out"
-    except h11.RemoteProtocolError as exc:
-        result.error = f"response read failed: {exc}"
-    except (h11.LocalProtocolError, ValueError, UnicodeError) as exc:
-        result.error = f"request failed: {exc}"
-    except HTTPTransportError as exc:
-        result.error = f"response read failed: {exc}"
-    except OSError as exc:
-        result.error = f"connection error: {exc}"
+    except (
+        ssl.SSLError,
+        asyncio.TimeoutError,
+        TimeoutError,
+        h11.RemoteProtocolError,
+        h11.LocalProtocolError,
+        ValueError,
+        UnicodeError,
+        HTTPTransportError,
+        OSError,
+    ) as exc:
+        result.error_category, result.error = classify_send_failure(exc, timeout)
     return result
 
 
@@ -742,6 +814,7 @@ def base_result(host: str) -> dict:
         "verdict": "ERROR",
         "status_code": None,
         "error": None,
+        "error_category": None,
         "reason": None,
         "sapi": None,
         "powered_by": None,
@@ -766,6 +839,7 @@ def response_metadata(response: HTTPResult) -> dict:
         "response_bytes": len(response.body),
         "bytes_sent": response.bytes_sent,
         "error": response.error,
+        "error_category": response.error_category,
         "description": describe_response(response),
     }
 
@@ -801,12 +875,23 @@ def check_url(
     result["control"] = response_metadata(control)
 
     if control.error:
-        result["error"] = f"control request failed: {control.error}"
+        result["error_category"] = control.error_category
+        result["error"] = (
+            f"control request failed: {control.error}. "
+            "Nothing was tested — the target never completed a single "
+            "request, so no verdict is possible"
+        )
         result["reason"] = result["error"]
         return result
     if control.status_code is not None and control.status_code >= 500:
         result["verdict"] = "INCONCLUSIVE"
-        result["error"] = f"control request returned HTTP {control.status_code}"
+        result["error_category"] = "server_error"
+        result["error"] = (
+            f"control request returned HTTP {control.status_code}. "
+            "The endpoint is already failing on a minimal 42-byte multipart "
+            "body, so the probes cannot distinguish a crash from the "
+            "pre-existing failure"
+        )
         result["reason"] = result["error"]
         return result
 
@@ -830,13 +915,20 @@ def check_url(
         apply_response(result, control)
         result["control"] = response_metadata(control)
         if control.error:
-            result["error"] = f"phpMyAdmin control request failed: {control.error}"
+            result["error_category"] = control.error_category
+            result["error"] = (
+                f"phpMyAdmin control request failed: {control.error}. "
+                "The phpMyAdmin endpoint was detected but could not be tested"
+            )
             result["reason"] = result["error"]
             return result
         if control.status_code is not None and control.status_code >= 500:
             result["verdict"] = "INCONCLUSIVE"
+            result["error_category"] = "server_error"
             result["error"] = (
-                f"phpMyAdmin control request returned HTTP {control.status_code}"
+                f"phpMyAdmin control request returned HTTP {control.status_code}. "
+                "/show_config_errors.php is already failing, so the probes "
+                "cannot distinguish a crash from the pre-existing failure"
             )
             result["reason"] = result["error"]
             return result
@@ -874,17 +966,27 @@ def check_url(
 
         if probe.error:
             result["verdict"] = "INCONCLUSIVE"
+            result["error_category"] = probe.error_category
             result["error"] = (
-                f"probe {index} failed before a response was read: {probe.error}"
+                f"probe {index} ({size_mib} MiB, {parts} parts) failed before a "
+                f"response was read: {probe.error}. The connection died "
+                "mid-upload, which a network fault and a crashing PHP worker "
+                "both look like — re-run before trusting either outcome"
             )
             result["reason"] = result["error"]
             return result
 
         if probe.status_code in REJECTED_STATUSES:
             rejected = True
+            hint = REJECTION_HINTS.get(
+                probe.status_code, "the request was refused before PHP parsed it"
+            )
             rejected_reason = (
-                f"probe {index} was rejected with HTTP {probe.status_code} "
-                "before PHP parsed it"
+                f"probe {index} ({size_mib} MiB, {parts} parts) was rejected "
+                f"with HTTP {probe.status_code} before PHP parsed it: {hint}. "
+                "The probes never reached PHP, so this says nothing about "
+                "vulnerability — try --sapi, a different path, or removing "
+                "the blocking proxy/WAF"
             )
             break
 
@@ -929,12 +1031,19 @@ def check_url(
         )
     elif rejected:
         result["verdict"] = "INCONCLUSIVE"
+        result["error_category"] = "request_rejected"
         result["error"] = rejected_reason
         result["reason"] = rejected_reason
     else:
         result["vulnerable"] = False
         result["verdict"] = "NO SIGNAL"
-        result["reason"] = "no crash observed and no PHP version advertised"
+        result["reason"] = (
+            "no crash observed and no PHP version advertised (no "
+            "X-Powered-By header). This is not proof of safety — the probes "
+            "ran clean, but without a version header the scanner cannot "
+            "confirm the running PHP is patched; check the version manually "
+            "or expose X-Powered-By"
+        )
     return result
 
 
@@ -1607,7 +1716,8 @@ def main() -> None:
             )
         except Exception as exc:  # Keep one bad target from aborting a scan.
             result = base_result(safe_url_label(host))
-            result["error"] = f"unexpected error: {exc}"
+            result["error_category"] = "internal"
+            result["error"] = f"unexpected error: {exc!r}"
             result["reason"] = result["error"]
             return result
 
