@@ -1686,6 +1686,7 @@ def print_summary(results: List[dict]) -> None:
     )
     group("INCONCLUSIVE - target answered in a way the probes cannot judge", inconclusive, Colors.YELLOW)
     group("ERROR - the check never completed", errors, Colors.YELLOW)
+    print()
     print(colorize("=" * 60, Colors.CYAN))
 
 
