@@ -11,10 +11,14 @@
 import argparse
 import asyncio
 import json
+import os
 import re
 import ssl
 import sys
+import time
 import zlib
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -57,6 +61,11 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 "
     "Safari/537.36 PHP2Shell/1.0.0"
 )
+DNSDUMPSTER_API_URL = "https://api.dnsdumpster.com/domain/{domain}"
+DNSDUMPSTER_API_KEY_ENV = "DNSDUMPSTER_API_KEY"
+DNSDUMPSTER_RATE_LIMIT_SECONDS = 2.0
+DNSDUMPSTER_MAX_PAGES = 10
+DNSDUMPSTER_RESPONSE_LIMIT = 8 << 20
 
 PROBES = ((1, 4000), (8, 1020), (20, 1020))
 REJECTED_STATUSES = {400, 403, 411, 413, 414, 417, 422, 429, 431}
@@ -998,11 +1007,254 @@ def deduplicate_hosts(hosts: List[str]) -> List[str]:
     return deduplicated
 
 
+def is_wildcard_pattern(value: str) -> bool:
+    """Return True when the input is a '*.domain' wildcard target."""
+    value = value.strip()
+    if not value:
+        return False
+    candidate = value if "://" in value else "https://" + value
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return False
+    return (parsed.hostname or "").startswith("*.")
+
+
+def parse_wildcard_pattern(raw: str) -> Tuple[str, str, Optional[int]]:
+    """Split a '*.domain' pattern into (scheme, domain, port).
+
+    An explicit scheme or port such as 'http://*.example.com:8080' is
+    preserved; an empty scheme means the scanner default (https).
+    """
+    value = raw.strip()
+    if not value:
+        raise ValueError("invalid or empty wildcard pattern")
+    explicit = "://" in value
+    candidate = value if explicit else "https://" + value
+    parsed = urlsplit(candidate)
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"invalid wildcard pattern: {raw!r}")
+    if hostname.startswith("*."):
+        hostname = hostname[2:]
+    if not hostname or "*" in hostname:
+        raise ValueError(f"invalid wildcard pattern: {raw!r}")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid wildcard pattern: {raw!r}") from exc
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError(f"invalid wildcard pattern: {raw!r}") from exc
+    scheme = parsed.scheme if explicit else ""
+    return scheme, hostname, port
+
+
+class DNSDumpsterError(Exception):
+    """Raised when the DNSDumpster API cannot return results."""
+
+
+_dnsdumpster_last_request = 0.0
+
+
+def dnsdumpster_wait_slot() -> None:
+    """Honour the DNSDumpster rate limit of one request every 2 seconds."""
+    global _dnsdumpster_last_request
+    elapsed = time.monotonic() - _dnsdumpster_last_request
+    if elapsed < DNSDUMPSTER_RATE_LIMIT_SECONDS:
+        time.sleep(DNSDUMPSTER_RATE_LIMIT_SECONDS - elapsed)
+    _dnsdumpster_last_request = time.monotonic()
+
+
+def dnsdumpster_error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        body = exc.read(1024).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return body
+    if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+        return payload["error"]
+    return body
+
+
+def dnsdumpster_get(
+    url: str, api_key: str, timeout: int, tolerate_http_error: bool = False
+) -> Optional[dict]:
+    """Fetch one DNSDumpster API page.
+
+    Returns the decoded payload, or None when tolerate_http_error is set and
+    the API answers with a non-2xx status other than a rate limit.
+    """
+    request = urllib.request.Request(
+        url,
+        headers={
+            "X-API-Key": api_key,
+            "Accept": "application/json",
+            "User-Agent": DEFAULT_USER_AGENT,
+        },
+    )
+    dnsdumpster_wait_slot()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(DNSDUMPSTER_RESPONSE_LIMIT)
+    except urllib.error.HTTPError as exc:
+        detail = dnsdumpster_error_detail(exc)
+        if exc.code == 429:
+            raise DNSDumpsterError(
+                "DNSDumpster API rate limit exceeded; retry in a few seconds"
+            ) from exc
+        if tolerate_http_error:
+            return None
+        suffix = f": {detail}" if detail else ""
+        raise DNSDumpsterError(
+            f"DNSDumpster API request failed (HTTP {exc.code}){suffix}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise DNSDumpsterError(f"DNSDumpster API request failed: {exc.reason}") from exc
+    except OSError as exc:
+        raise DNSDumpsterError(f"DNSDumpster API request failed: {exc}") from exc
+
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise DNSDumpsterError("DNSDumpster API returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise DNSDumpsterError("DNSDumpster API returned an unexpected response")
+    api_error = payload.get("error")
+    if isinstance(api_error, str):
+        raise DNSDumpsterError(f"DNSDumpster API error: {api_error}")
+    return payload
+
+
+def collect_api_hosts(payload: dict) -> List[str]:
+    """Extract every host name from a DNSDumpster API payload."""
+    names: List[str] = []
+    for records in payload.values():
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if isinstance(record, dict) and isinstance(record.get("host"), str):
+                names.append(record["host"])
+    return names
+
+
+def qualify_subdomains(domain: str, names: List[str]) -> List[str]:
+    """Keep real web subdomains of domain, in order and without duplicates.
+
+    Wildcard entries and underscore records such as _dmarc or _sip are
+    skipped because they never answer HTTP requests.
+    """
+    suffix = "." + domain
+    qualified: List[str] = []
+    seen = set()
+    for raw in names:
+        name = raw.strip().lower().rstrip(".")
+        if not name or "*" in name or "_" in name:
+            continue
+        if not name.endswith(suffix):
+            continue
+        try:
+            name = name.encode("idna").decode("ascii")
+        except UnicodeError:
+            continue
+        if name not in seen:
+            seen.add(name)
+            qualified.append(name)
+    return qualified
+
+
+def fetch_dnsdumpster_hosts(domain: str, api_key: str, timeout: int) -> List[str]:
+    """Return every subdomain DNSDumpster lists for domain."""
+    names: List[str] = []
+    seen = set()
+    for page in range(1, DNSDUMPSTER_MAX_PAGES + 1):
+        url = DNSDUMPSTER_API_URL.format(domain=quote(domain, safe=""))
+        if page > 1:
+            url += f"?page={page}"
+        # Pages beyond the first need a paid membership; stop quietly.
+        payload = dnsdumpster_get(url, api_key, max(timeout, 30), tolerate_http_error=page > 1)
+        if payload is None:
+            break
+        added = 0
+        page_names = collect_api_hosts(payload)
+        for name in page_names:
+            lowered = name.strip().lower()
+            if lowered and lowered not in seen:
+                seen.add(lowered)
+                added += 1
+        names.extend(page_names)
+        if added == 0:
+            break
+    return qualify_subdomains(domain, names)
+
+
+def expand_wildcard_targets(
+    patterns: List[str], api_key: str, timeout: int, announce: bool = True
+) -> Tuple[List[str], Dict[str, List[str]], List[str]]:
+    """Expand '*.domain' patterns into concrete scan targets.
+
+    Returns (targets, expansions, errors); the apex domain of every pattern
+    is always included ahead of its discovered subdomains.
+    """
+    targets: List[str] = []
+    expansions: Dict[str, List[str]] = {}
+    errors: List[str] = []
+
+    unique: List[str] = []
+    seen_patterns = set()
+    for pattern in patterns:
+        key = pattern.strip().lower()
+        if key and key not in seen_patterns:
+            seen_patterns.add(key)
+            unique.append(pattern)
+
+    for pattern in unique:
+        try:
+            scheme, domain, port = parse_wildcard_pattern(pattern)
+        except ValueError as exc:
+            errors.append(str(exc))
+            if announce:
+                print(colorize(f"[!] {exc}", Colors.YELLOW))
+            continue
+
+        prefix = f"{scheme}://" if scheme else ""
+        suffix = f":{port}" if port is not None else ""
+        apex = f"{prefix}{domain}{suffix}"
+
+        if announce:
+            print(colorize(f"[*] Querying DNSDumpster for {domain} ...", Colors.CYAN))
+        try:
+            discovered = fetch_dnsdumpster_hosts(domain, api_key, timeout)
+        except DNSDumpsterError as exc:
+            errors.append(f"{pattern}: {exc}")
+            if announce:
+                print(colorize(f"[!] {pattern}: {exc}", Colors.YELLOW))
+            continue
+
+        hosts = [apex] + [f"{prefix}{name}{suffix}" for name in discovered]
+        expansions[pattern] = hosts
+        targets.extend(hosts)
+        if announce:
+            print(
+                colorize(
+                    f"[+] {pattern}: {len(discovered)} subdomain(s) found "
+                    f"plus the apex domain {domain}",
+                    Colors.GREEN,
+                )
+            )
+    return targets, expansions, errors
+
+
 def save_results(
     results: List[dict],
     output_file: str,
     vulnerable_only: bool = True,
     announce: bool = True,
+    expansions: Optional[Dict[str, List[str]]] = None,
 ) -> bool:
     selected = (
         [result for result in results if result.get("vulnerable") is True]
@@ -1014,6 +1266,8 @@ def save_results(
         "total_results": len(selected),
         "results": selected,
     }
+    if expansions:
+        output["wildcard_expansions"] = expansions
     try:
         with open(output_file, "w", encoding="utf-8") as handle:
             json.dump(output, handle, indent=2)
@@ -1065,15 +1319,22 @@ def build_parser() -> argparse.ArgumentParser:
 Examples:
   %(prog)s -u https://example.com
   %(prog)s -l hosts.txt -t 20 -o results.json
+  %(prog)s -u "*.example.com" --dnsdumpster-key $DNSDUMPSTER_API_KEY
   %(prog)s -u https://example.com -H "Authorization: Bearer token"
   %(prog)s -u https://example.com --path /phpinfo.php
   %(prog)s -l hosts.txt --sapi fpm --timeout 90
         """,
     )
     input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument("-u", "--url", help="Single URL/host to check")
     input_group.add_argument(
-        "-l", "--list", help="File containing hosts (one per line)"
+        "-u",
+        "--url",
+        help="Single URL/host to check; '*.domain.com' expands all subdomains",
+    )
+    input_group.add_argument(
+        "-l",
+        "--list",
+        help="File containing hosts (one per line; '*.domain.com' lines expand)",
     )
     parser.add_argument(
         "-t", "--threads", type=int, default=10, help="Concurrent threads (default: 10)"
@@ -1128,6 +1389,16 @@ Examples:
     parser.add_argument(
         "--path-file", help="File containing paths to test (one per line)"
     )
+    parser.add_argument(
+        "--dnsdumpster-key",
+        dest="dnsdumpster_key",
+        metavar="KEY",
+        help=(
+            "DNSDumpster API key used to expand '*.domain.com' targets "
+            f"(default: ${DNSDUMPSTER_API_KEY_ENV}; free keys at "
+            "https://dnsdumpster.com/membership/)"
+        ),
+    )
     return parser
 
 
@@ -1148,7 +1419,29 @@ def main() -> None:
         raise SystemExit(str(exc)) from exc
 
     loaded_hosts = [args.url] if args.url else load_lines(args.list, "host")
-    hosts = deduplicate_hosts(loaded_hosts)
+    patterns = [value for value in loaded_hosts if is_wildcard_pattern(value)]
+    hosts_input = [value for value in loaded_hosts if not is_wildcard_pattern(value)]
+
+    expansions: Dict[str, List[str]] = {}
+    if patterns:
+        api_key = (
+            args.dnsdumpster_key or os.environ.get(DNSDUMPSTER_API_KEY_ENV) or ""
+        ).strip()
+        if not api_key:
+            raise SystemExit(
+                "Wildcard targets (*.domain.com) require a DNSDumpster API key.\n"
+                "Pass --dnsdumpster-key KEY or set the "
+                f"{DNSDUMPSTER_API_KEY_ENV} environment variable.\n"
+                "Free keys: https://dnsdumpster.com/membership/"
+            )
+        expanded, expansions, expand_errors = expand_wildcard_targets(
+            patterns, api_key, args.timeout, announce=not args.quiet
+        )
+        hosts_input.extend(expanded)
+        if not expanded and expand_errors:
+            raise SystemExit("Wildcard expansion failed: " + "; ".join(expand_errors))
+
+    hosts = deduplicate_hosts(hosts_input)
     if not hosts:
         raise SystemExit("No hosts to scan")
 
@@ -1163,8 +1456,17 @@ def main() -> None:
     if not args.quiet:
         print_banner()
         print(colorize(f"[*] Loaded {len(hosts)} host(s) to scan", Colors.CYAN))
-        if len(hosts) != len(loaded_hosts):
-            duplicate_count = len(loaded_hosts) - len(hosts)
+        if expansions:
+            expanded_count = sum(len(value) for value in expansions.values())
+            print(
+                colorize(
+                    f"[*] Expanded {len(expansions)} wildcard pattern(s) into "
+                    f"{expanded_count} host(s) via DNSDumpster",
+                    Colors.CYAN,
+                )
+            )
+        if len(hosts) != len(hosts_input):
+            duplicate_count = len(hosts_input) - len(hosts)
             print(
                 colorize(
                     f"[*] Skipped {duplicate_count} duplicate host(s)", Colors.CYAN
@@ -1259,6 +1561,7 @@ def main() -> None:
             args.output,
             vulnerable_only=not args.all_results,
             announce=not args.quiet,
+            expansions=expansions or None,
         )
     if not output_saved:
         raise SystemExit(2)
