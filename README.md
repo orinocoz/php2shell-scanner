@@ -216,6 +216,42 @@ Results are printed to the terminal. When using `-o`, vulnerable hosts are saved
 
 `-v` prints the reason for every verdict, and INCONCLUSIVE/ERROR reasons are shown even without it.
 
+### Scan summary
+
+After the scan the summary lists every tested endpoint grouped by outcome, so you can see which host is at risk and how much to trust each verdict — not just counts:
+
+```
+============================================================
+SCAN SUMMARY
+============================================================
+  Total hosts scanned: 6
+  Vulnerable: 1
+  Not vulnerable: 2
+    verified patched (X-Powered-By): 1
+    NO SIGNAL - version unknown, NOT proof of safety: 1
+  Inconclusive/errors: 3
+    tls: 2
+    dns: 1
+
+AT RISK - VULNERABLE (1)
+    http://…/files/ — found via directory listing at http://…/files/: probe 1 …
+
+CONFIRMED PATCHED - X-Powered-By advertises a fixed release (1)
+    http://…/clean.php — no crash observed and X-Powered-By reports a patched r…
+
+NO SIGNAL - probes ran clean but the PHP version is unknown; verify manually (1)
+    http://…/empty/ — the target is a directory listing and links no .php files…
+
+INCONCLUSIVE - target answered in a way the probes cannot judge (0)
+    (none)
+
+ERROR - the check never completed (3)
+    https://…/index.php — dns: control request failed: [Errno -2] Name or…
+============================================================
+```
+
+Every group prints the per-host verdict reason (truncated to the terminal width; the full text is in the JSON). The vulnerable group is never truncated; other groups list up to 15 hosts and point to `-o results.json` beyond that. `Inconclusive/errors` also breaks the failures down by `error_category`, so a timeout-heavy scan (your network) reads differently from a `request_rejected`-heavy one (a WAF in front of the target).
+
 ### Error categories
 
 Transport failures carry an `error_category` in the JSON (`result.error_category`, and per-request in the `control` and `probes` objects), together with a plain-language explanation of what happened and what to do next:

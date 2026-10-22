@@ -14,6 +14,7 @@ import html
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
 import sys
@@ -1617,6 +1618,77 @@ def print_result(result: dict, verbose: bool = False) -> None:
             print(f"    {terminal_safe(line)}")
 
 
+def print_summary(results: List[dict]) -> None:
+    vulnerable = [r for r in results if r["vulnerable"] is True]
+    fixed = [r for r in results if r["verdict"] == "FIXED"]
+    no_signal = [r for r in results if r["verdict"] == "NO SIGNAL"]
+    inconclusive = [r for r in results if r["verdict"] == "INCONCLUSIVE"]
+    errors = [r for r in results if r["verdict"] == "ERROR"]
+    not_vulnerable = sum(1 for r in results if r["vulnerable"] is False)
+
+    width = max(shutil.get_terminal_size((100, 24)).columns, 60)
+
+    def line(host: str, label: str, reason: str) -> str:
+        text = f"    {host} — {label}: {reason}" if label else f"    {host} — {reason}"
+        text = terminal_safe(text)
+        return text if len(text) <= width else text[: width - 1] + "…"
+
+    print()
+    print(colorize("=" * 60, Colors.CYAN))
+    print(colorize("SCAN SUMMARY", Colors.BOLD))
+    print(colorize("=" * 60, Colors.CYAN))
+    print(f"  Total hosts scanned: {len(results)}")
+    vulnerable_label = f"Vulnerable: {len(vulnerable)}"
+    print(f"  {colorize(vulnerable_label, Colors.RED + Colors.BOLD) if vulnerable else vulnerable_label}")
+    print(f"  Not vulnerable: {not_vulnerable}")
+    if fixed:
+        print(f"    verified patched (X-Powered-By): {len(fixed)}")
+    if no_signal:
+        print(
+            colorize(
+                f"    NO SIGNAL - version unknown, NOT proof of safety: {len(no_signal)}",
+                Colors.YELLOW,
+            )
+        )
+    print(f"  Inconclusive/errors: {len(inconclusive) + len(errors)}")
+    categories: Dict[str, int] = {}
+    for r in inconclusive + errors:
+        category = r["error_category"] or "unknown"
+        categories[category] = categories.get(category, 0) + 1
+    for category, count in sorted(categories.items(), key=lambda kv: -kv[1]):
+        print(f"    {category}: {count}")
+
+    def group(title: str, items: List[dict], color: str, cap: int = 15) -> None:
+        print()
+        print(colorize(f"{title} ({len(items)})", color))
+        if not items:
+            print("    (none)")
+            return
+        shown = items if len(items) <= cap else items[:cap]
+        for r in shown:
+            label = ""
+            if r["verdict"] == "ERROR" or r["verdict"] == "INCONCLUSIVE":
+                label = r["error_category"] or "unknown"
+            print(line(r["host"], label, r["reason"] or r["error"] or ""))
+        if len(items) > len(shown):
+            print(f"    … and {len(items) - len(shown)} more (see -o results.json)")
+
+    group("AT RISK - VULNERABLE", vulnerable, Colors.RED + Colors.BOLD, cap=len(vulnerable))
+    group(
+        "CONFIRMED PATCHED - X-Powered-By advertises a fixed release",
+        fixed,
+        Colors.GREEN,
+    )
+    group(
+        "NO SIGNAL - probes ran clean but the PHP version is unknown; verify manually",
+        no_signal,
+        Colors.YELLOW,
+    )
+    group("INCONCLUSIVE - target answered in a way the probes cannot judge", inconclusive, Colors.YELLOW)
+    group("ERROR - the check never completed", errors, Colors.YELLOW)
+    print(colorize("=" * 60, Colors.CYAN))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="php2shell Scanner",
@@ -1876,20 +1948,8 @@ def main() -> None:
                     progress.update(1)
 
     vulnerable_count = sum(result["vulnerable"] is True for result in results)
-    error_count = sum(result["vulnerable"] is None for result in results)
     if not args.quiet:
-        print()
-        print(colorize("=" * 60, Colors.CYAN))
-        print(colorize("SCAN SUMMARY", Colors.BOLD))
-        print(colorize("=" * 60, Colors.CYAN))
-        print(f"  Total hosts scanned: {len(hosts)}")
-        vulnerable_label = f"Vulnerable: {vulnerable_count}"
-        if vulnerable_count:
-            vulnerable_label = colorize(vulnerable_label, Colors.RED + Colors.BOLD)
-        print(f"  {vulnerable_label}")
-        print(f"  Not vulnerable: {len(results) - vulnerable_count - error_count}")
-        print(f"  Inconclusive/errors: {error_count}")
-        print(colorize("=" * 60, Colors.CYAN))
+        print_summary(results)
 
     output_saved = True
     if args.output:
