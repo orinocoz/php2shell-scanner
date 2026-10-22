@@ -1660,13 +1660,18 @@ def print_summary(
     for category, count in sorted(categories.items(), key=lambda kv: -kv[1]):
         print(f"    {category}: {count}")
 
+    # Truncate only when every verdict is also saved to the output file;
+    # otherwise the terminal is the only place these lines exist.
+    full_detail_saved = bool(output) and all_results
+
     def group(title: str, items: List[dict], color: str, cap: int = 15) -> None:
         print()
         print(colorize(f"{title} ({len(items)})", color))
         if not items:
             print("    (none)")
             return
-        shown = items if len(items) <= cap else items[:cap]
+        limit = cap if full_detail_saved else len(items)
+        shown = items if len(items) <= limit else items[:limit]
         for r in shown:
             label = ""
             if r["verdict"] == "ERROR" or r["verdict"] == "INCONCLUSIVE":
@@ -1674,13 +1679,7 @@ def print_summary(
             print(line(r["host"], label, r["reason"] or r["error"] or ""))
         if len(items) > len(shown):
             hidden = len(items) - len(shown)
-            if not output:
-                more = "re-run with -o results.json --all-results to keep them"
-            elif not all_results:
-                more = f"not in {output} (add --all-results to keep them)"
-            else:
-                more = f"see {output}"
-            print(f"    … and {hidden} more ({more})")
+            print(f"    … and {hidden} more (see {output})")
 
     group("AT RISK - VULNERABLE", vulnerable, Colors.RED + Colors.BOLD, cap=len(vulnerable))
     group(
