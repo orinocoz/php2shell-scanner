@@ -26,6 +26,8 @@ Targets written in `*.domain.com` style are expanded into the apex domain plus e
 python3 scanner.py -u "*.example.com"
 ```
 
+A full step-by-step guide for wildcard scanning with DNSDumpster (getting a key, configuring it, examples, and troubleshooting) is in [docs/wildcard-dnsdumpster.md](docs/wildcard-dnsdumpster.md).
+
 Two discovery sources are available, controlled with `--subdomain-source`:
 
 - `dnsdumpster` — the official DNSDumpster API (`https://api.dnsdumpster.com/domain/<domain>`). Needs an API key, which is free at [dnsdumpster.com](https://dnsdumpster.com/membership/); supply it with `--dnsdumpster-key` or the `DNSDUMPSTER_API_KEY` environment variable. Free keys return up to 50 records per domain; Plus keys return up to 200 per page and pagination is followed automatically. The API is rate limited to one request every 2 seconds, which the scanner observes.
