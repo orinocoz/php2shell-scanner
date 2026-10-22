@@ -1618,7 +1618,9 @@ def print_result(result: dict, verbose: bool = False) -> None:
             print(f"    {terminal_safe(line)}")
 
 
-def print_summary(results: List[dict]) -> None:
+def print_summary(
+    results: List[dict], output: Optional[str] = None, all_results: bool = False
+) -> None:
     vulnerable = [r for r in results if r["vulnerable"] is True]
     fixed = [r for r in results if r["verdict"] == "FIXED"]
     no_signal = [r for r in results if r["verdict"] == "NO SIGNAL"]
@@ -1671,7 +1673,14 @@ def print_summary(results: List[dict]) -> None:
                 label = r["error_category"] or "unknown"
             print(line(r["host"], label, r["reason"] or r["error"] or ""))
         if len(items) > len(shown):
-            print(f"    … and {len(items) - len(shown)} more (see -o results.json)")
+            hidden = len(items) - len(shown)
+            if not output:
+                more = "re-run with -o results.json --all-results to keep them"
+            elif not all_results:
+                more = f"not in {output} (add --all-results to keep them)"
+            else:
+                more = f"see {output}"
+            print(f"    … and {hidden} more ({more})")
 
     group("AT RISK - VULNERABLE", vulnerable, Colors.RED + Colors.BOLD, cap=len(vulnerable))
     group(
@@ -1950,7 +1959,7 @@ def main() -> None:
 
     vulnerable_count = sum(result["vulnerable"] is True for result in results)
     if not args.quiet:
-        print_summary(results)
+        print_summary(results, args.output, args.all_results)
 
     output_saved = True
     if args.output:
