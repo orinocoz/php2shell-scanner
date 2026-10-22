@@ -1,0 +1,6 @@
+.git
+__pycache__
+*.py[cod]
+*.json
+hosts.txt
+paths.txt
